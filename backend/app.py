@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -23,7 +24,7 @@ log = logging.getLogger("objremover")
 ROOT = Path(__file__).resolve().parent.parent
 MAX_POINTS = 64
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
-LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 QUALITIES = ("fast", "sdxl", "flux")
 
 
@@ -83,20 +84,33 @@ def create_app(segmenter=None, inpainter=None, refiners=None, *, load_models: bo
     if load_models:
         threading.Thread(target=state.load_all, name="model-loader", daemon=True).start()
 
+    def foreign_origin(request: Request) -> bool:
+        if request.headers.get("sec-fetch-site") == "cross-site":
+            return True
+        origin = request.headers.get("origin")
+        if not origin:
+            return False  # same-origin GET, curl, or a non-browser client
+        try:
+            parts = urlsplit(origin)  # handles IPv6 brackets, userinfo, "null"
+            host, _ = parts.hostname, parts.port  # .port raises on a non-numeric port
+        except ValueError:
+            return True
+        # A browser serializes Origin as scheme://host[:port] and nothing else.
+        if parts.username is not None or parts.path or parts.query or parts.fragment:
+            return True
+        return parts.scheme not in ("http", "https") or host not in LOCAL_HOSTS
+
     @app.middleware("http")
     async def reject_cross_site(request: Request, call_next):
         """The server only listens on loopback, but any web page the user visits could
         still POST to it (a 12 GB download or a 5-minute GPU job). Browsers always
         send Origin on cross-origin POSTs and Sec-Fetch-Site on all fetches, so
-        refuse API calls that carry a foreign origin."""
-        if request.url.path.startswith("/api/"):
-            if request.headers.get("sec-fetch-site") == "cross-site":
-                return JSONResponse(status_code=403, content={"detail": "cross-site requests are not allowed"})
-            origin = request.headers.get("origin")
-            if origin:
-                host = origin.split("://", 1)[-1].rsplit(":", 1)[0] if not origin.endswith("]") else origin.split("://", 1)[-1]
-                if host not in LOCAL_HOSTS:
-                    return JSONResponse(status_code=403, content={"detail": "cross-site requests are not allowed"})
+        refuse every mutating request, and every /api call, that carries a foreign
+        origin. Checking the method rather than only the path means no path
+        spelling can route around the check."""
+        mutating = request.method not in ("GET", "HEAD", "OPTIONS")
+        if (mutating or request.url.path.startswith("/api/")) and foreign_origin(request):
+            return JSONResponse(status_code=403, content={"detail": "cross-site requests are not allowed"})
         return await call_next(request)
 
     async def read_upload(upload: UploadFile) -> bytes:

@@ -199,12 +199,24 @@ def test_cross_site_requests_are_rejected(client):
     """A web page in the user's browser must not be able to drive the local API."""
     img = png_rgb(8, 8)
     pts = json.dumps([{"x": 2, "y": 2}])
-    for headers in ({"Origin": "https://evil.example"}, {"Sec-Fetch-Site": "cross-site"}):
+    foreign = (
+        {"Origin": "https://evil.example"},
+        {"Sec-Fetch-Site": "cross-site"},
+        {"Origin": "null"},
+        {"Origin": "http://localhost.evil.example"},
+        {"Origin": "http://127.0.0.1.evil.example:5177"},
+        {"Origin": "http://localhost:evil"},  # naive "strip the port" parsing let this through
+        {"Origin": "http://localhost:5177.evil.example"},
+        {"Origin": "http://evil.example@localhost"},
+    )
+    for headers in foreign:
         r = client.post("/api/segment", files={"image": ("a.png", img, "image/png")}, data={"points": pts}, headers=headers)
         assert r.status_code == 403, headers
-        assert client.post("/api/models/sdxl/load", headers=headers).status_code == 403
+        assert client.post("/api/models/sdxl/load", headers=headers).status_code == 403, headers
+        # Any mutating request is checked, whatever the path spelling.
+        assert client.post("//api/segment", headers=headers).status_code == 403, headers
     # Same-origin and no-Origin (curl) requests still work.
-    for headers in ({"Origin": "http://127.0.0.1:5177"}, {"Origin": "http://localhost:5177"}, {}):
+    for headers in ({"Origin": "http://127.0.0.1:5177"}, {"Origin": "http://localhost:5177"}, {"Origin": "http://[::1]:5177"}, {}):
         r = client.post("/api/segment", files={"image": ("a.png", img, "image/png")}, data={"points": pts}, headers=headers)
         assert r.status_code == 200, headers
     assert client.get("/api/health", headers={"Origin": "https://evil.example"}).status_code == 403

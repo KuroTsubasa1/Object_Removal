@@ -193,3 +193,30 @@ def test_lama_inpainter_dilation_scales_with_image(tmp_path):
     assert radius > 3
     assert tuple(out[1010 + radius - 1, 1005]) != (10, 10, 10)
     assert tuple(out[1010 + radius + 1, 1005]) == (10, 10, 10)
+
+
+def test_cross_site_requests_are_rejected(client):
+    """A web page in the user's browser must not be able to drive the local API."""
+    img = png_rgb(8, 8)
+    pts = json.dumps([{"x": 2, "y": 2}])
+    for headers in ({"Origin": "https://evil.example"}, {"Sec-Fetch-Site": "cross-site"}):
+        r = client.post("/api/segment", files={"image": ("a.png", img, "image/png")}, data={"points": pts}, headers=headers)
+        assert r.status_code == 403, headers
+        assert client.post("/api/models/sdxl/load", headers=headers).status_code == 403
+    # Same-origin and no-Origin (curl) requests still work.
+    for headers in ({"Origin": "http://127.0.0.1:5177"}, {"Origin": "http://localhost:5177"}, {}):
+        r = client.post("/api/segment", files={"image": ("a.png", img, "image/png")}, data={"points": pts}, headers=headers)
+        assert r.status_code == 200, headers
+    assert client.get("/api/health", headers={"Origin": "https://evil.example"}).status_code == 403
+
+
+def test_oversized_upload_is_rejected(client, monkeypatch):
+    from backend import app as app_module
+
+    monkeypatch.setattr(app_module, "MAX_UPLOAD_BYTES", 100)
+    img = png_rgb(64, 64)
+    assert len(img) > 100
+    r = client.post("/api/segment", files={"image": ("a.png", img, "image/png")}, data={"points": json.dumps([{"x": 2, "y": 2}])})
+    assert r.status_code == 413
+    r = client.post("/api/inpaint", files={"image": ("a.png", img, "image/png"), "mask": ("m.png", png_rgba_mask(64, 64, (8, 8, 24, 24)), "image/png")})
+    assert r.status_code == 413

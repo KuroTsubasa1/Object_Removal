@@ -22,6 +22,8 @@ from .segmenter import Point, Sam2Segmenter
 log = logging.getLogger("objremover")
 ROOT = Path(__file__).resolve().parent.parent
 MAX_POINTS = 64
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 QUALITIES = ("fast", "sdxl", "flux")
 
 
@@ -81,6 +83,28 @@ def create_app(segmenter=None, inpainter=None, refiners=None, *, load_models: bo
     if load_models:
         threading.Thread(target=state.load_all, name="model-loader", daemon=True).start()
 
+    @app.middleware("http")
+    async def reject_cross_site(request: Request, call_next):
+        """The server only listens on loopback, but any web page the user visits could
+        still POST to it (a 12 GB download or a 5-minute GPU job). Browsers always
+        send Origin on cross-origin POSTs and Sec-Fetch-Site on all fetches, so
+        refuse API calls that carry a foreign origin."""
+        if request.url.path.startswith("/api/"):
+            if request.headers.get("sec-fetch-site") == "cross-site":
+                return JSONResponse(status_code=403, content={"detail": "cross-site requests are not allowed"})
+            origin = request.headers.get("origin")
+            if origin:
+                host = origin.split("://", 1)[-1].rsplit(":", 1)[0] if not origin.endswith("]") else origin.split("://", 1)[-1]
+                if host not in LOCAL_HOSTS:
+                    return JSONResponse(status_code=403, content={"detail": "cross-site requests are not allowed"})
+        return await call_next(request)
+
+    async def read_upload(upload: UploadFile) -> bytes:
+        data = await upload.read(MAX_UPLOAD_BYTES + 1)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, f"upload exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+        return data
+
     @app.get("/api/health")
     def health():
         return {
@@ -120,7 +144,7 @@ def create_app(segmenter=None, inpainter=None, refiners=None, *, load_models: bo
             raise HTTPException(400, f"invalid points: {err}")
         if not pts or len(pts) > MAX_POINTS:
             raise HTTPException(400, f"points must contain 1..{MAX_POINTS} entries")
-        data = await image.read()
+        data = await read_upload(image)
         key = hashlib.sha256(data).hexdigest()
         try:
             rgb = ops.decode_rgb(data)
@@ -162,8 +186,14 @@ def create_app(segmenter=None, inpainter=None, refiners=None, *, load_models: bo
             if not refiner.loaded:
                 raise HTTPException(503, f"{refiner.label} is not loaded yet")
         try:
-            rgb = ops.decode_rgb(await image.read())
-            m = ops.decode_mask(await mask.read(), size=(rgb.shape[1], rgb.shape[0]))
+            image_bytes, mask_bytes = await read_upload(image), await read_upload(mask)
+        except HTTPException:
+            raise
+        except Exception as err:  # noqa: BLE001
+            raise HTTPException(400, f"could not read input: {err}")
+        try:
+            rgb = ops.decode_rgb(image_bytes)
+            m = ops.decode_mask(mask_bytes, size=(rgb.shape[1], rgb.shape[0]))
         except ValueError as err:
             raise HTTPException(400, str(err))
         except Exception as err:  # noqa: BLE001
